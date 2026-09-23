@@ -1,246 +1,106 @@
-import io
-import os
-import re
-import html
+import os,io,sqlite3,hashlib,hmac,re,json
+from pathlib import Path
+from datetime import datetime
 import pandas as pd
-import numpy as np
-import streamlit as st
-import plotly.express as px
+from fastapi import FastAPI,Request,UploadFile,File,Form,HTTPException
+from fastapi.responses import HTMLResponse,RedirectResponse,StreamingResponse
+from starlette.middleware.sessions import SessionMiddleware
 from pypdf import PdfReader
 from docx import Document
 
-st.set_page_config(page_title="InsightDash", page_icon="📊", layout="wide")
+ROOT=Path(__file__).parent; DB=ROOT/'data/insightdash.db'; DB.parent.mkdir(exist_ok=True)
+app=FastAPI(title='InsightDash V2'); app.add_middleware(SessionMiddleware,secret_key=os.getenv('SESSION_SECRET','CHANGE_ME'),max_age=28800)
 
-st.markdown("""
-<style>
-.block-container {max-width: 1400px; padding-top: 2rem;}
-.hero {padding: 28px; border-radius: 22px; background: linear-gradient(135deg,#0b1220,#172554);
-        color:white; margin-bottom:22px;}
-.hero h1 {font-size: 42px; margin:0;}
-.hero p {font-size:18px; opacity:.85;}
-.kpi {padding:20px; border-radius:18px; background:#fff; border:1px solid #e7eaf0;
-      box-shadow:0 6px 22px rgba(15,23,42,.06);}
-.kpi-label {color:#667085; font-size:14px;}
-.kpi-value {font-size:27px; font-weight:700; margin-top:5px;}
-.insight {padding:16px 18px; border-left:4px solid #2563eb; background:#f8fafc;
-          border-radius:12px; margin:8px 0;}
-</style>
-""", unsafe_allow_html=True)
+def conn():
+ c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+c=conn(); c.executescript('''CREATE TABLE IF NOT EXISTS tenants(id INTEGER PRIMARY KEY,name TEXT,created_at TEXT);CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,tenant_id INTEGER,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,created_at TEXT);CREATE TABLE IF NOT EXISTS dashboards(id INTEGER PRIMARY KEY,tenant_id INTEGER,user_id INTEGER,name TEXT,metric TEXT,dimension TEXT,date_col TEXT,data_json TEXT,created_at TEXT);CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,tenant_id INTEGER,user_id INTEGER,action TEXT,created_at TEXT);'''); c.commit(); c.close()
 
-st.markdown("""
-<div class="hero">
-<h1>📊 InsightDash</h1>
-<p>Transforme seus arquivos empresariais em dashboards executivos.</p>
-</div>
-""", unsafe_allow_html=True)
+def hp(x): return hashlib.sha256(x.encode()).hexdigest()
+def esc(x): import html; return html.escape(str(x))
+CSS='''body{margin:0;background:#f5f7fb;color:#0f172a;font-family:Inter,system-ui,sans-serif}nav{height:64px;background:white;border-bottom:1px solid #e2e8f0;padding:0 5%;display:flex;align-items:center;justify-content:space-between}.logo{font-size:22px;font-weight:800}.logo b{color:#2563eb}a{text-decoration:none;color:#2563eb}.btn{background:#2563eb;color:white;padding:11px 16px;border-radius:11px;border:0;font-weight:700}.container{max-width:1250px;margin:auto;padding:30px 5%}.hero{padding:55px;border-radius:26px;background:linear-gradient(135deg,#0b1220,#2563eb);color:white}.hero h1{font-size:46px;margin:0 0 12px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin:22px 0}.card{background:white;border:1px solid #e2e8f0;border-radius:18px;padding:20px;box-shadow:0 8px 25px #0f172a0b}.big{font-size:28px;font-weight:800}.muted{color:#64748b}.form{max-width:500px;margin:35px auto}.form input{width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:10px;margin:7px 0 16px;box-sizing:border-box}.chart{height:380px}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}.hero h1{font-size:34px}}'''
+def page(title,body,u=None):
+ nav=f'<nav><div class="logo">Insight<b>Dash</b></div><div>'+(f'<a href="/dashboard">Visão geral</a> &nbsp; <a href="/upload">Importar</a> &nbsp; <a href="/logout">Sair</a>' if u else '<a class="btn" href="/register">Começar</a>')+'</div></nav>'
+ return f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)}</title><script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script><style>{CSS}</style></head><body>{nav}<main class="container">{body}</main></body></html>'
+def user(req):
+ uid=req.session.get('uid');
+ if not uid:return None
+ c=conn(); u=c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); c.close(); return u
+def auth(req):
+ u=user(req)
+ if not u: raise HTTPException(303,headers={'Location':'/login'})
+ return u
+def parse(name,data):
+ e=Path(name).suffix.lower()
+ if e in ('.xlsx','.xls'):
+  ss=pd.read_excel(io.BytesIO(data),sheet_name=None); fs=[f for f in ss.values() if not f.empty]; return pd.concat(fs,ignore_index=True) if fs else pd.DataFrame()
+ if e=='.csv': return pd.read_csv(io.BytesIO(data),sep=None,engine='python')
+ if e=='.pdf':
+  r=PdfReader(io.BytesIO(data)); return pd.DataFrame({'conteudo_extraido':[x for x in '\n'.join((p.extract_text() or '') for p in r.pages).splitlines() if x.strip()]})
+ if e=='.docx':
+  d=Document(io.BytesIO(data)); return pd.DataFrame({'conteudo_extraido':[p.text for p in d.paragraphs if p.text.strip()]})
+ raise ValueError('Formato não suportado')
+def clean(df):
+ df=df.dropna(how='all').drop_duplicates().copy(); df.columns=[re.sub('_+','_',re.sub(r'[^\wÀ-ÿ]+','_',str(x).lower())).strip('_') or 'campo' for x in df.columns]
+ for c in df.columns:
+  if df[c].dtype=='object':
+   x=df[c].astype(str).str.strip(); n=pd.to_numeric(x.str.replace('R$','',regex=False).str.replace('.','',regex=False).str.replace(',','.',regex=False),errors='coerce')
+   if n.notna().mean()>.75: df[c]=n; continue
+   d=pd.to_datetime(x,errors='coerce',dayfirst=True)
+   if d.notna().mean()>.8: df[c]=d
+ return df
 
-@st.cache_data(show_spinner=False)
-def parse_file(name, data):
-    ext = os.path.splitext(name.lower())[1]
-    if ext in [".xlsx", ".xls"]:
-        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
-        frames = []
-        for sheet, frame in sheets.items():
-            if not frame.empty:
-                frame = frame.copy()
-                frame["_origem_aba"] = sheet
-                frames.append(frame)
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    if ext == ".csv":
-        for enc in ["utf-8-sig", "utf-8", "latin1"]:
-            try:
-                return pd.read_csv(io.BytesIO(data), encoding=enc, sep=None, engine="python")
-            except Exception:
-                pass
-        raise ValueError("CSV inválido.")
-    if ext == ".pdf":
-        # Extração simples de tabelas/texto
-        reader = PdfReader(io.BytesIO(data))
-        text = "\n".join((p.extract_text() or "") for p in reader.pages)
-        return pd.DataFrame({"conteudo_extraido": [x.strip() for x in text.splitlines() if x.strip()]})
-    if ext == ".docx":
-        doc = Document(io.BytesIO(data))
-        rows = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-        for table in doc.tables:
-            for row in table.rows:
-                rows.append(" | ".join(c.text.strip() for c in row.cells))
-        return pd.DataFrame({"conteudo_extraido": rows})
-    raise ValueError("Formato não suportado.")
-
-def normalize_col(c):
-    c = str(c).strip().lower()
-    c = re.sub(r"[^\wÀ-ÿ]+", "_", c, flags=re.UNICODE)
-    return re.sub(r"_+", "_", c).strip("_") or "campo"
-
-def clean_data(df):
-    df = df.copy()
-    df.columns = [normalize_col(c) for c in df.columns]
-    df = df.dropna(how="all").drop_duplicates().reset_index(drop=True)
-
-    for c in df.columns:
-        if df[c].dtype == "object":
-            x = df[c].astype(str).str.strip()
-            x2 = x.str.replace(r"R\$\s*", "", regex=True)
-            br = x2.str.match(r"^-?\d{1,3}(\.\d{3})+,\d+$|^-?\d+,\d+$", na=False)
-            y = x2.copy()
-            y.loc[br] = y.loc[br].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-            y.loc[~br] = y.loc[~br].str.replace(",", "", regex=False)
-            n = pd.to_numeric(y, errors="coerce")
-            if n.notna().mean() >= .75:
-                df[c] = n
-                continue
-            d = pd.to_datetime(x, errors="coerce", dayfirst=True)
-            if d.notna().mean() >= .80:
-                df[c] = d
-    return df
-
-def money(v):
-    if pd.isna(v): return "—"
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-def number(v):
-    if pd.isna(v): return "—"
-    return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-with st.sidebar:
-    st.header("📁 Sua análise")
-    uploads = st.file_uploader(
-        "Envie Excel, CSV, PDF ou Word",
-        type=["xlsx","xls","csv","pdf","docx"],
-        accept_multiple_files=True
-    )
-    st.caption("Arquivos são processados na sessão. Para produção, use armazenamento privado e autenticação.")
-
-if not uploads:
-    st.info("👆 Envie um arquivo na barra lateral para começar.")
-    st.stop()
-
-frames = []
-errors = []
-for f in uploads:
-    try:
-        x = parse_file(f.name, f.getvalue())
-        if not x.empty:
-            x["_arquivo"] = f.name
-            frames.append(x)
-    except Exception as e:
-        errors.append(f"{f.name}: {e}")
-
-if errors:
-    st.warning("Alguns arquivos não puderam ser processados: " + " | ".join(errors))
-if not frames:
-    st.error("Nenhum dado foi extraído.")
-    st.stop()
-
-df = clean_data(pd.concat(frames, ignore_index=True, sort=False))
-
-num_cols = df.select_dtypes(include=np.number).columns.tolist()
-date_cols = df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns.tolist()
-cat_cols = [c for c in df.columns if c not in num_cols + date_cols]
-
-if not num_cols:
-    st.warning("Não encontrei métricas numéricas. Você ainda pode visualizar a base tratada.")
-    st.dataframe(df, use_container_width=True, height=500)
-    st.download_button("⬇️ Baixar CSV tratado", df.to_csv(index=False).encode("utf-8-sig"),
-                       "insightdash_tratado.csv", "text/csv")
-    st.stop()
-
-# Sugestões inteligentes
-words = ["venda","fatur","receita","valor","preco","preço","lucro","quant","qtd","total","custo"]
-metric_scores = {c: sum(w in c for w in words) for c in num_cols}
-metric_default = max(num_cols, key=lambda c: (metric_scores[c], df[c].notna().sum()))
-
-dim_words = ["produto","cliente","categoria","regiao","região","vendedor","cidade","estado","canal","marca"]
-if cat_cols:
-    dim_default = max(cat_cols, key=lambda c: (sum(w in c for w in dim_words), -df[c].nunique(dropna=True)))
-else:
-    dim_default = None
-
-with st.sidebar:
-    metric = st.selectbox("Métrica principal", num_cols, index=num_cols.index(metric_default))
-    if cat_cols:
-        dim = st.selectbox("Dimensão", cat_cols, index=cat_cols.index(dim_default))
-    else:
-        dim = None
-    date = st.selectbox("Data", ["Nenhuma"] + date_cols)
-    date = None if date == "Nenhuma" else date
-
-    st.divider()
-    if dim:
-        vals = sorted(df[dim].dropna().astype(str).unique().tolist())
-        selected = st.multiselect(f"Filtrar {dim}", vals, default=[])
-    else:
-        selected = []
-
-view = df.copy()
-if dim and selected:
-    view = view[view[dim].astype(str).isin(selected)]
-
-st.caption(f"Base analisada: **{len(view):,} registros** · {len(view.columns)} campos")
-
-c1,c2,c3,c4 = st.columns(4)
-with c1:
-    st.markdown(f'<div class="kpi"><div class="kpi-label">Total de {metric}</div><div class="kpi-value">{number(view[metric].sum())}</div></div>', unsafe_allow_html=True)
-with c2:
-    st.markdown(f'<div class="kpi"><div class="kpi-label">Média</div><div class="kpi-value">{number(view[metric].mean())}</div></div>', unsafe_allow_html=True)
-with c3:
-    st.markdown(f'<div class="kpi"><div class="kpi-label">Máximo</div><div class="kpi-value">{number(view[metric].max())}</div></div>', unsafe_allow_html=True)
-with c4:
-    st.markdown(f'<div class="kpi"><div class="kpi-label">Registros</div><div class="kpi-value">{len(view):,}</div></div>', unsafe_allow_html=True)
-
-st.divider()
-
-if date:
-    t = view[[date, metric]].dropna().copy()
-    t["periodo"] = t[date].dt.to_period("M").dt.to_timestamp()
-    monthly = t.groupby("periodo", as_index=False)[metric].sum()
-    fig = px.area(monthly, x="periodo", y=metric, markers=True, title="📈 Evolução")
-    fig.update_layout(template="plotly_white", height=420)
-    st.plotly_chart(fig, use_container_width=True)
-
-a,b = st.columns(2)
-if dim:
-    rank = view.groupby(dim, dropna=False)[metric].sum().sort_values(ascending=False).head(15).reset_index()
-    with a:
-        fig = px.bar(rank, x=metric, y=dim, orientation="h", title=f"🏆 Top {dim}")
-        fig.update_layout(template="plotly_white", height=500, yaxis={"categoryorder":"total ascending"})
-        st.plotly_chart(fig, use_container_width=True)
-    with b:
-        mix = view.groupby(dim, dropna=False)[metric].sum().sort_values(ascending=False).head(10).reset_index()
-        fig = px.pie(mix, names=dim, values=metric, hole=.5, title=f"🍩 Participação")
-        fig.update_layout(template="plotly_white", height=500)
-        st.plotly_chart(fig, use_container_width=True)
-else:
-    st.dataframe(view, use_container_width=True)
-
-st.subheader("🧠 Insights automáticos")
-insights = []
-total = view[metric].sum()
-if dim and total:
-    g = view.groupby(dim)[metric].sum().sort_values(ascending=False)
-    if len(g):
-        share = g.iloc[0]/total*100
-        insights.append(f"O grupo **{g.index[0]}** concentra aproximadamente **{share:.1f}%** do total de `{metric}`.")
-if date and len(view) >= 2:
-    s = view[[date,metric]].dropna().sort_values(date)
-    if len(s) >= 2 and s.iloc[0][metric] != 0:
-        ch = (s.iloc[-1][metric]-s.iloc[0][metric])/abs(s.iloc[0][metric])*100
-        insights.append(f"A variação entre o primeiro e o último registro disponível é de aproximadamente **{ch:.1f}%**.")
-q1,q3 = view[metric].quantile([.25,.75])
-iqr=q3-q1
-out=view[(view[metric] < q1-1.5*iqr) | (view[metric] > q3+1.5*iqr)]
-insights.append(f"Foram identificados **{len(out):,} possíveis outliers** na métrica selecionada pelo método do IQR.")
-for x in insights:
-    st.markdown(f'<div class="insight">💡 {x}</div>', unsafe_allow_html=True)
-
-with st.expander("🔎 Ver dados tratados"):
-    st.dataframe(view, use_container_width=True, height=500)
-
-st.download_button(
-    "⬇️ Baixar base tratada",
-    view.to_csv(index=False).encode("utf-8-sig"),
-    "insightdash_tratado.csv",
-    "text/csv"
-)
-
-st.caption("InsightDash • Protótipo web. Para dados sensíveis, configure autenticação, armazenamento privado, limites de upload e políticas de retenção antes de uso comercial.")
+@app.get('/',response_class=HTMLResponse)
+def home(req:Request):
+ if user(req): return RedirectResponse('/dashboard',303)
+ return page('Início','''<section class="hero"><h1>Transforme dados em decisões.</h1><p>Envie Excel, CSV, PDF ou Word e crie dashboards executivos em minutos.</p><br><a class="btn" href="/register">Começar agora →</a></section><div class="grid"><div class="card"><h3>📤 Importar</h3><p class="muted">Suas bases empresariais.</p></div><div class="card"><h3>🧹 Tratar</h3><p class="muted">Limpeza automática.</p></div><div class="card"><h3>📊 Analisar</h3><p class="muted">KPIs, rankings e tendências.</p></div><div class="card"><h3>⬇ Exportar</h3><p class="muted">Baixe os resultados.</p></div></div>''')
+@app.get('/register',response_class=HTMLResponse)
+def rg(req:Request): return page('Cadastro','''<div class="form card"><h1>Criar empresa</h1><form method="post"><label>Empresa</label><input name="company" required><label>Nome</label><input name="name" required><label>E-mail</label><input name="email" type="email" required><label>Senha</label><input name="password" type="password" minlength="8" required><button class="btn">Criar conta</button></form></div>''')
+@app.post('/register')
+def rp(request:Request,company:str=Form(...),name:str=Form(...),email:str=Form(...),password:str=Form(...)):
+ c=conn(); now=datetime.utcnow().isoformat()
+ try:
+  tid=c.execute('INSERT INTO tenants(name,created_at) VALUES(?,?)',(company,now)).lastrowid; uid=c.execute('INSERT INTO users(tenant_id,name,email,password,role,created_at) VALUES(?,?,?,?,?,?)',(tid,name,email.lower(),hp(password),'admin',now)).lastrowid;c.commit();request.session['uid']=uid;return RedirectResponse('/dashboard',303)
+ except sqlite3.IntegrityError:return HTMLResponse(page('Erro','<div class="card"><h2>E-mail já cadastrado.</h2></div>'),400)
+ finally:c.close()
+@app.get('/login',response_class=HTMLResponse)
+def lg(req:Request): return page('Login','''<div class="form card"><h1>Entrar</h1><form method="post"><label>E-mail</label><input name="email" type="email" required><label>Senha</label><input name="password" type="password" required><button class="btn">Entrar</button></form></div>''')
+@app.post('/login')
+def lp(request:Request,email:str=Form(...),password:str=Form(...)):
+ c=conn();u=c.execute('SELECT * FROM users WHERE email=?',(email.lower(),)).fetchone();c.close()
+ if not u or hp(password)!=u['password']: return HTMLResponse(page('Erro','<div class="card"><h2>Login inválido.</h2></div>'),401)
+ request.session['uid']=u['id'];return RedirectResponse('/dashboard',303)
+@app.get('/logout')
+def lo(req:Request):req.session.clear();return RedirectResponse('/',303)
+@app.get('/dashboard',response_class=HTMLResponse)
+def dash(req:Request):
+ u=auth(req);c=conn();ds=c.execute('SELECT * FROM dashboards WHERE tenant_id=? ORDER BY id DESC',(u['tenant_id'],)).fetchall();c.close();cards=''.join(f'<div class="card"><h3>📊 {esc(x["name"])}</h3><p class="muted">{x["created_at"][:10]}</p><a class="btn" href="/dashboards/{x["id"]}">Abrir</a> <a href="/download/{x["id"]}">Baixar</a></div>' for x in ds) or '<div class="card"><h3>Nenhum dashboard ainda</h3><p>Envie sua primeira base.</p></div>'
+ return page('Visão geral',f'<h1>Olá, {esc(u["name"])} 👋</h1><p class="muted">Ambiente privado da sua empresa.</p><p><a class="btn" href="/upload">＋ Novo dashboard</a></p><div class="grid">{cards}</div>',u)
+@app.get('/upload',response_class=HTMLResponse)
+def ug(req:Request):
+ u=auth(req);return page('Importar','''<div class="form card"><h1>📤 Novo dashboard</h1><form method="post" enctype="multipart/form-data"><label>Nome</label><input name="dash_name" required placeholder="Vendas 2026"><label>Arquivo</label><input type="file" name="file" accept=".xlsx,.xls,.csv,.pdf,.docx" required><button class="btn">Processar →</button></form></div>''',u)
+@app.post('/upload')
+async def up(req:Request,file:UploadFile=File(...),dash_name:str=Form(...)):
+ u=auth(req);data=await file.read()
+ if len(data)>20*1024*1024:raise HTTPException(413,'Arquivo maior que 20 MB')
+ try:df=clean(parse(file.filename,data))
+ except Exception as e:raise HTTPException(400,str(e))
+ nums=df.select_dtypes('number').columns.tolist();dates=df.select_dtypes('datetime').columns.tolist();cats=[c for c in df.columns if c not in nums+dates]
+ if not nums:raise HTTPException(400,'Nenhuma métrica numérica identificada.')
+ words=['venda','fatur','receita','valor','preco','preço','lucro','quant','qtd','total','custo'];metric=max(nums,key=lambda c:(sum(w in c for w in words),df[c].notna().sum()));dim=max(cats,key=lambda c:(sum(w in c for w in ['produto','cliente','categoria','regiao','região','vendedor','marca']),-df[c].nunique())) if cats else None;date=dates[0] if dates else None
+ for c in dates:df[c]=df[c].astype(str)
+ now=datetime.utcnow().isoformat();c=conn();did=c.execute('INSERT INTO dashboards(tenant_id,user_id,name,metric,dimension,date_col,data_json,created_at) VALUES(?,?,?,?,?,?,?,?)',(u['tenant_id'],u['id'],dash_name,metric,dim,date,df.to_json(orient='records'),now)).lastrowid;c.execute('INSERT INTO audit(tenant_id,user_id,action,created_at) VALUES(?,?,?,?)',(u['tenant_id'],u['id'],f'created:{did}',now));c.commit();c.close();return RedirectResponse(f'/dashboards/{did}',303)
+@app.get('/dashboards/{did}',response_class=HTMLResponse)
+def view(did:int,req:Request):
+ u=auth(req);c=conn();r=c.execute('SELECT * FROM dashboards WHERE id=? AND tenant_id=?',(did,u['tenant_id'])).fetchone();c.close()
+ if not r:raise HTTPException(404,'Dashboard não encontrado')
+ df=pd.read_json(io.StringIO(r['data_json']));m=r['metric'];d=r['dimension'];date=r['date_col'];total=df[m].sum();avg=df[m].mean();mx=df[m].max();body=f'<h1>{esc(r["name"])}</h1><p class="muted">Dashboard privado</p><div class="grid"><div class="card"><span class="muted">Total</span><div class="big">{total:,.2f}</div></div><div class="card"><span class="muted">Média</span><div class="big">{avg:,.2f}</div></div><div class="card"><span class="muted">Máximo</span><div class="big">{mx:,.2f}</div></div><div class="card"><span class="muted">Registros</span><div class="big">{len(df):,}</div></div></div><p><a class="btn" href="/download/{did}">⬇ Baixar dados</a></p>'
+ if date:
+  t=df[[date,m]].dropna();t[date]=pd.to_datetime(t[date]);t['p']=t[date].dt.to_period('M').dt.to_timestamp();g=t.groupby('p',as_index=False)[m].sum();body+=f'<div class="card"><h2>📈 Evolução</h2><div id="c1" class="chart"></div></div><script>Plotly.newPlot("c1",[{{x:{json.dumps(g.p.astype(str).tolist())},y:{json.dumps(g[m].tolist())},mode:"lines+markers",fill:"tozeroy"}}],{{template:"plotly_white"}})</script>'
+ if d:
+  g=df.groupby(d)[m].sum().sort_values(ascending=False).head(12).reset_index();body+=f'<div class="card"><h2>🏆 Ranking</h2><div id="c2" class="chart"></div></div><script>Plotly.newPlot("c2",[{{x:{json.dumps(g[m].tolist())},y:{json.dumps(g[d].astype(str).tolist())},type:"bar",orientation:"h"}}],{{template:"plotly_white",yaxis:{{autorange:"reversed"}}}})</script>'
+ return page(r['name'],body,u)
+@app.get('/download/{did}')
+def dl(did:int,req:Request):
+ u=auth(req);c=conn();r=c.execute('SELECT * FROM dashboards WHERE id=? AND tenant_id=?',(did,u['tenant_id'])).fetchone();c.close()
+ if not r:raise HTTPException(404,'Dashboard não encontrado')
+ df=pd.read_json(io.StringIO(r['data_json']));b=df.to_csv(index=False).encode('utf-8-sig');return StreamingResponse(io.BytesIO(b),media_type='text/csv',headers={'Content-Disposition':f'attachment; filename="insightdash_{did}.csv"'})
