@@ -95,11 +95,30 @@ def view(did:int,req:Request):
  u=auth(req);c=conn();r=c.execute('SELECT * FROM dashboards WHERE id=? AND tenant_id=?',(did,u['tenant_id'])).fetchone();c.close()
  if not r:raise HTTPException(404,'Dashboard não encontrado')
  df=pd.read_json(io.StringIO(r['data_json']));m=r['metric'];d=r['dimension'];date=r['date_col'];total=df[m].sum();avg=df[m].mean();mx=df[m].max();body=f'<h1>{esc(r["name"])}</h1><p class="muted">Dashboard privado</p><div class="grid"><div class="card"><span class="muted">Total</span><div class="big">{total:,.2f}</div></div><div class="card"><span class="muted">Média</span><div class="big">{avg:,.2f}</div></div><div class="card"><span class="muted">Máximo</span><div class="big">{mx:,.2f}</div></div><div class="card"><span class="muted">Registros</span><div class="big">{len(df):,}</div></div></div><p><a class="btn" href="/download/{did}">⬇ Baixar dados</a></p>'
- if date:
-  t=df[[date,m]].dropna();t[date]=pd.to_datetime(t[date]);t['p']=t[date].dt.to_period('M').dt.to_timestamp();g=t.groupby('p',as_index=False)[m].sum();body+=f'<div class="card"><h2>📈 Evolução</h2><div id="c1" class="chart"></div></div><script>Plotly.newPlot("c1",[{{x:{json.dumps(g.p.astype(str).tolist())},y:{json.dumps(g[m].tolist())},mode:"lines+markers",fill:"tozeroy"}}],{{template:"plotly_white"}})</script>'
- if d:
-  g=df.groupby(d)[m].sum().sort_values(ascending=False).head(12).reset_index();body+=f'<div class="card"><h2>🏆 Ranking</h2><div id="c2" class="chart"></div></div><script>Plotly.newPlot("c2",[{{x:{json.dumps(g[m].tolist())},y:{json.dumps(g[d].astype(str).tolist())},type:"bar",orientation:"h"}}],{{template:"plotly_white",yaxis:{{autorange:"reversed"}}}})</script>'
- return page(r['name'],body,u)
+   if date:
+   chart_type=req.query_params.get('evolucao','line')
+   if chart_type not in ('line','bar','area'): chart_type='line'
+   t=df[[date,m]].dropna();t[date]=pd.to_datetime(t[date]);t['p']=t[date].dt.to_period('M').dt.to_timestamp();g=t.groupby('p',as_index=False)[m].sum()
+   x=json.dumps(g.p.astype(str).tolist());y=json.dumps(g[m].tolist())
+   if chart_type=='bar':
+    plot=f'{{x:{x},y:{y},type:"bar"}}'
+   elif chart_type=='area':
+    plot=f'{{x:{x},y:{y},mode:"lines+markers",fill:"tozeroy"}}'
+   else:
+    plot=f'{{x:{x},y:{y},mode:"lines+markers"}}'
+   body+=f'''<div class="card">
+   <h2>📈 Evolução</h2>
+   <form method="get" action="/dashboards/{did}" style="margin-bottom:15px">
+   <label><b>Tipo de gráfico:</b></label>
+   <select name="evolucao" onchange="this.form.submit()" style="padding:10px;border:1px solid #cbd5e1;border-radius:10px">
+   <option value="line" {"selected" if chart_type=="line" else ""}>Linha</option>
+   <option value="bar" {"selected" if chart_type=="bar" else ""}>Barras</option>
+   <option value="area" {"selected" if chart_type=="area" else ""}>Área</option>
+   </select>
+   </form>
+   <div id="c1" class="chart"></div>
+   </div>
+   <script>Plotly.newPlot("c1",[{plot}],{{template:"plotly_white"}})</script>'''
 @app.get('/download/{did}')
 def dl(did:int,req:Request):
  u=auth(req);c=conn();r=c.execute('SELECT * FROM dashboards WHERE id=? AND tenant_id=?',(did,u['tenant_id'])).fetchone();c.close()
